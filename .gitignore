@@ -2,9 +2,14 @@
 .env
 .env.*
 !.env.example
+.streamlit/secrets.toml
 
 # 의존성
 node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
 
 # 빌드 결과물
 dist/
