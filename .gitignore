@@ -1,0 +1,23 @@
+# 환경 변수 / 비밀 값 (.env.example은 추적한다)
+.env
+.env.*
+!.env.example
+
+# 의존성
+node_modules/
+
+# 빌드 결과물
+dist/
+build/
+out/
+.next/
+coverage/
+
+# 로그
+*.log
+npm-debug.log*
+
+# OS / 에디터
+.DS_Store
+.idea/
+.vscode/
