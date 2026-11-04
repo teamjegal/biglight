@@ -1,12 +1,13 @@
-"""Supabase 백엔드 데이터 접근 계층.
+"""Supabase 백엔드 데이터 접근 계층 (로그인 + 학생/교수 역할).
 
 앱은 이 모듈을 통해서만 데이터를 읽고 쓴다. 자격 증명(SUPABASE_URL/KEY)이
-설정돼 있으면 Supabase와 통신하고, 없거나 통신에 실패하면 ``data.sample``의
-가상 데이터로 자동 폴백한다. 덕분에 테스트·오프라인 환경에서도 앱이 그대로
-동작한다.
+있으면 Supabase 를, 없으면 ``data.sample`` 의 가상 데이터를 담은 메모리 백엔드를
+쓴다. 두 백엔드는 같은 인터페이스(select/insert/update/login)라서, 뷰를 만드는
+로직과 쓰기 로직은 한 벌만 있다.
 
-반환 구조는 기존 ``data.sample``과 동일한 모양(날짜는 ``datetime.date``)이라
-페이지 코드를 거의 바꾸지 않고 연동할 수 있다.
+권한 모델: 역할(학생/교수) 검사는 이 모듈(앱 계층)에서 한다. DB 의 RLS 는 데모용
+전체 허용이므로, 실서비스라면 Supabase Auth JWT 기반 RLS 로 DB 에서도 강제해야 한다.
+비밀번호는 DB 에 해시로만 있고, 검증은 ``lms_login`` RPC 가 서버에서 한다.
 """
 
 from __future__ import annotations
@@ -18,6 +19,13 @@ from datetime import date, datetime
 import streamlit as st
 
 from . import sample
+
+# anon 키로는 password_hash 컬럼을 읽을 수 없으므로 사용자 조회는 이 컬럼만 쓴다.
+USER_COLUMNS = "id,login_id,role,name,department,semester"
+
+
+class PermissionDenied(Exception):
+    """역할/소유권 검사에 걸린 쓰기 시도."""
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +46,7 @@ def _creds() -> tuple[str | None, str | None]:
 
 @st.cache_resource(show_spinner=False)
 def _client():
-    """Supabase 클라이언트(없으면 None). 세션 동안 재사용."""
+    """Supabase 클라이언트(없으면 None). 서버 프로세스 동안 재사용."""
     url, key = _creds()
     if not url or not key:
         return None
@@ -51,12 +59,99 @@ def _client():
 
 
 def is_connected() -> bool:
-    """실제 Supabase 백엔드에 연결돼 있으면 True, 폴백 모드면 False."""
+    """실제 Supabase 백엔드에 연결돼 있으면 True, 메모리(샘플) 모드면 False."""
     return _client() is not None
 
 
+# ---------------------------------------------------------------------------
+# 백엔드 — Supabase / 메모리. 인터페이스: select, insert, update, login.
+# ---------------------------------------------------------------------------
+def _jsonable(row: dict) -> dict:
+    return {k: (v.isoformat() if isinstance(v, (date, datetime)) else v) for k, v in row.items()}
+
+
+class _SupabaseBackend:
+    def __init__(self, client):
+        self.c = client
+
+    def select(self, table: str, eq: dict | None = None, in_: dict | None = None) -> list[dict]:
+        q = self.c.table(table).select(USER_COLUMNS if table == "lms_users" else "*")
+        for k, v in (eq or {}).items():
+            q = q.eq(k, v)
+        for k, v in (in_ or {}).items():
+            if not v:
+                return []
+            q = q.in_(k, list(v))
+        return q.execute().data or []
+
+    def insert(self, table: str, row: dict) -> dict:
+        return self.c.table(table).insert(_jsonable(row)).execute().data[0]
+
+    def update(self, table: str, values: dict, eq: dict) -> None:
+        q = self.c.table(table).update(_jsonable(values))
+        for k, v in eq.items():
+            q = q.eq(k, v)
+        q.execute()
+
+    def login(self, login_id: str, password: str) -> dict | None:
+        data = self.c.rpc("lms_login", {"p_login_id": login_id, "p_password": password}).execute().data
+        return data[0] if data else None
+
+
+class _MemoryBackend:
+    """샘플 데이터를 세션 상태에 두고 같은 인터페이스로 읽고 쓴다."""
+
+    def __init__(self, tables: dict[str, list[dict]]):
+        self.t = tables
+
+    @staticmethod
+    def _public(table: str, row: dict) -> dict:
+        row = copy.deepcopy(row)
+        if table == "lms_users":
+            row.pop("password", None)
+        return row
+
+    def select(self, table: str, eq: dict | None = None, in_: dict | None = None) -> list[dict]:
+        out = []
+        for r in self.t[table]:
+            if any(r.get(k) != v for k, v in (eq or {}).items()):
+                continue
+            if any(r.get(k) not in set(v) for k, v in (in_ or {}).items()):
+                continue
+            out.append(self._public(table, r))
+        return out
+
+    def insert(self, table: str, row: dict) -> dict:
+        rows = self.t[table]
+        new = dict(row)
+        if "id" not in new:
+            new["id"] = max((r["id"] for r in rows if isinstance(r.get("id"), int)), default=0) + 1
+        rows.append(new)
+        return self._public(table, new)
+
+    def update(self, table: str, values: dict, eq: dict) -> None:
+        for r in self.t[table]:
+            if all(r.get(k) == v for k, v in eq.items()):
+                r.update(values)
+
+    def login(self, login_id: str, password: str) -> dict | None:
+        for u in self.t["lms_users"]:
+            if u["login_id"] == login_id and u["password"] == password:
+                return self._public("lms_users", u)
+        return None
+
+
+def _backend():
+    client = _client()
+    if client is not None:
+        return _SupabaseBackend(client)
+    if "_mem_tables" not in st.session_state:
+        st.session_state["_mem_tables"] = sample.sample_tables()
+    return _MemoryBackend(st.session_state["_mem_tables"])
+
+
 def _to_date(value):
-    """DB가 돌려준 날짜/타임스탬프 문자열을 ``date`` 로 변환."""
+    """DB 가 돌려준 날짜 문자열(또는 date/datetime)을 ``date`` 로 변환."""
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -66,213 +161,317 @@ def _to_date(value):
     return date.fromisoformat(str(value)[:10])
 
 
+def _session_user(row: dict) -> dict:
+    return {k: row.get(k) for k in ("id", "login_id", "role", "name", "department", "semester")}
+
+
 # ---------------------------------------------------------------------------
-# 읽기
+# 로그인
 # ---------------------------------------------------------------------------
-def _rows(client, table: str, order: str | None = None):
-    q = client.table(table).select("*")
-    if order:
-        q = q.order(order)
-    return q.execute().data or []
+def login(login_id: str, password: str) -> dict | None:
+    """아이디/비밀번호가 맞으면 사용자 dict, 아니면 None. 연결 오류는 예외."""
+    login_id = (login_id or "").strip()
+    if not login_id or not password:
+        return None
+    row = _backend().login(login_id, password)
+    return _session_user(row) if row else None
 
 
-def _load_from_db(client) -> dict:
-    # 과목 + 자료 + 과제를 한 번에 읽어 과목 단위로 묶는다.
-    course_rows = _rows(client, "lms_courses", "sort_order")
-    mat_rows = _rows(client, "lms_materials", "week")
-    asg_rows = _rows(client, "lms_assignments", "id")
+# ---------------------------------------------------------------------------
+# 읽기 — 학생 뷰
+# ---------------------------------------------------------------------------
+def _course_meta(courses_raw: list[dict]) -> tuple[dict, dict]:
+    colors = {c["id"]: c.get("card_color") or "#3b5bdb" for c in courses_raw}
+    codes = {c["id"]: c.get("course_code") or c["id"] for c in courses_raw}
+    return colors, codes
 
-    mats_by: dict[str, list] = {}
-    for m in mat_rows:
-        mats_by.setdefault(m["course_id"], []).append(
-            {
-                "week": m["week"],
-                "title": m["title"],
-                "type": m["type"],
-                "size_kb": m["size_kb"],
-                "posted": _to_date(m["posted"]),
-            }
-        )
 
-    asg_by: dict[str, list] = {}
-    for a in asg_rows:
-        asg_by.setdefault(a["course_id"], []).append(
-            {
-                "id": a["id"],
-                "title": a["title"],
-                "due": _to_date(a["due"]),
-                "points": a["points"],
-                "status": a["status"],
-                "score": a["score"],
-            }
-        )
+def _material(m: dict) -> dict:
+    return {"id": m["id"], "week": m["week"], "title": m["title"], "type": m["type"],
+            "size_kb": m["size_kb"], "posted": _to_date(m["posted"])}
 
-    courses, card_colors, course_code = [], {}, {}
-    for c in course_rows:
-        courses.append(
-            {
-                "id": c["id"],
-                "title": c["title"],
-                "professor": c["professor"],
-                "schedule": c["schedule"],
-                "room": c["room"],
-                "materials": mats_by.get(c["id"], []),
-                "assignments": asg_by.get(c["id"], []),
-            }
-        )
-        card_colors[c["id"]] = c.get("card_color") or "#3b5bdb"
-        course_code[c["id"]] = c.get("course_code") or c["id"]
 
-    attendance: dict[str, list] = {}
-    for r in _rows(client, "lms_attendance", "week"):
-        attendance.setdefault(r["course_id"], []).append(
-            {"week": r["week"], "date": _to_date(r["date"]), "status": r["status"]}
-        )
+def _announcement(a: dict) -> dict:
+    return {"id": a["id"], "course_id": a["course_id"], "title": a["title"], "body": a["body"],
+            "posted": _to_date(a["posted"]), "pinned": bool(a["pinned"])}
 
-    announcements = [
-        {
-            "course_id": a["course_id"],
-            "title": a["title"],
-            "body": a["body"],
-            "posted": _to_date(a["posted"]),
-            "pinned": a["pinned"],
-        }
-        for a in _rows(client, "lms_announcements")
+
+def _qna_posts(b, course_ids: list[str]) -> list[dict]:
+    posts = b.select("lms_qna", in_={"course_id": course_ids})
+    replies: dict[int, list] = {}
+    for r in sorted(b.select("lms_qna_replies", in_={"qna_id": [q["id"] for q in posts]}),
+                    key=lambda r: r["id"]):
+        replies.setdefault(r["qna_id"], []).append({"author": r["author"], "body": r["body"]})
+    return [
+        {"id": q["id"], "course_id": q["course_id"], "author": q["author"], "title": q["title"],
+         "body": q["body"], "posted": _to_date(q["posted"]), "answered": bool(q["answered"]),
+         "replies": replies.get(q["id"], [])}
+        for q in sorted(posts, key=lambda q: q["id"])
     ]
 
-    exams: dict[str, list] = {c["id"]: [] for c in course_rows}
-    for e in _rows(client, "lms_exams"):
-        exams.setdefault(e["course_id"], []).append(
-            {"name": e["name"], "score": e["score"], "max": e["max"], "date": _to_date(e["date"])}
-        )
 
-    lectures: dict[str, list] = {}
-    for v in _rows(client, "lms_lectures", "week"):
-        lectures.setdefault(v["course_id"], []).append(
-            {
-                "id": v["id"],
-                "week": v["week"],
-                "title": v["title"],
-                "duration_min": v["duration_min"],
-                "watched_pct": v["watched_pct"],
-            }
-        )
+def load_student(user: dict) -> dict:
+    """로그인한 학생의 화면용 데이터 한 벌."""
+    b = _backend()
+    sid = user["id"]
+    cids = [e["course_id"] for e in b.select("lms_enrollments", eq={"student_id": sid})]
+    courses_raw = sorted(b.select("lms_courses", in_={"id": cids}), key=lambda c: c.get("sort_order") or 0)
+    cids = [c["id"] for c in courses_raw]
+    profs = {u["id"]: u["name"] for u in
+             b.select("lms_users", in_={"id": [c["professor_id"] for c in courses_raw if c.get("professor_id")]})}
 
-    reps_by: dict[int, list] = {}
-    for r in _rows(client, "lms_qna_replies", "created_at"):
-        reps_by.setdefault(r["qna_id"], []).append({"author": r["author"], "body": r["body"]})
-    qna = [
-        {
-            "id": q["id"],
-            "course_id": q["course_id"],
-            "author": q["author"],
-            "title": q["title"],
-            "body": q["body"],
-            "posted": _to_date(q["posted"]),
-            "answered": q["answered"],
-            "replies": reps_by.get(q["id"], []),
-        }
-        for q in _rows(client, "lms_qna", "posted")
-    ]
+    mats: dict[str, list] = {}
+    for m in b.select("lms_materials", in_={"course_id": cids}):
+        mats.setdefault(m["course_id"], []).append(_material(m))
+    subs = {s["assignment_id"]: s for s in b.select("lms_submissions", eq={"student_id": sid})}
+    asg: dict[str, list] = {}
+    for a in sorted(b.select("lms_assignments", in_={"course_id": cids}), key=lambda a: a["id"]):
+        s = subs.get(a["id"])
+        asg.setdefault(a["course_id"], []).append({
+            "id": a["id"], "title": a["title"], "due": _to_date(a["due"]), "points": a["points"],
+            "status": s["status"] if s else "open",
+            "score": s["score"] if s else None,
+            "late": bool(s and s.get("late")),
+        })
 
-    student_rows = _rows(client, "lms_students")
-    if student_rows:
-        s = student_rows[0]
-        student = {
-            "name": s["name"],
-            "student_id": s["student_id"],
-            "major": s["major"],
-            "semester": s["semester"],
-        }
+    courses = [{
+        "id": c["id"], "title": c["title"], "professor": profs.get(c.get("professor_id"), ""),
+        "schedule": c["schedule"], "room": c["room"],
+        "materials": sorted(mats.get(c["id"], []), key=lambda m: m["week"]),
+        "assignments": asg.get(c["id"], []),
+    } for c in courses_raw]
+
+    attendance: dict[str, list] = {cid: [] for cid in cids}
+    for r in sorted(b.select("lms_attendance", eq={"student_id": sid}), key=lambda r: r["week"]):
+        if r["course_id"] in attendance:
+            attendance[r["course_id"]].append(
+                {"week": r["week"], "date": _to_date(r["date"]), "status": r["status"]})
+
+    lectures: dict[str, list] = {cid: [] for cid in cids}
+    progress = {p["lecture_id"]: p["watched_pct"] for p in b.select("lms_lecture_progress", eq={"student_id": sid})}
+    for v in sorted(b.select("lms_lectures", in_={"course_id": cids}), key=lambda v: (v["course_id"], v["week"])):
+        lectures[v["course_id"]].append({
+            "id": v["id"], "week": v["week"], "title": v["title"],
+            "duration_min": v["duration_min"], "watched_pct": progress.get(v["id"], 0)})
+
+    exams: dict[str, list] = {cid: [] for cid in cids}
+    for e in b.select("lms_exams", eq={"student_id": sid}):
+        if e["course_id"] in exams:
+            exams[e["course_id"]].append(
+                {"name": e["name"], "score": e["score"], "max": e["max"], "date": _to_date(e["date"])})
+
+    announcements = [_announcement(a) for a in b.select("lms_announcements")
+                     if a["course_id"] is None or a["course_id"] in cids]
+    colors, codes = _course_meta(courses_raw)
+    return {
+        "user": user,
+        "student": {"name": user["name"], "student_id": user["login_id"],
+                    "major": user["department"], "semester": user["semester"]},
+        "courses": courses, "attendance": attendance, "lectures": lectures, "exams": exams,
+        "announcements": announcements, "qna": _qna_posts(b, cids),
+        "card_colors": colors, "course_code": codes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 읽기 — 교수 뷰
+# ---------------------------------------------------------------------------
+def load_professor(user: dict) -> dict:
+    """로그인한 교수가 맡은 과목들의 관리 화면용 데이터 한 벌."""
+    b = _backend()
+    courses_raw = sorted(b.select("lms_courses", eq={"professor_id": user["id"]}),
+                         key=lambda c: c.get("sort_order") or 0)
+    cids = [c["id"] for c in courses_raw]
+
+    enroll = b.select("lms_enrollments", in_={"course_id": cids})
+    students = {u["id"]: u for u in b.select("lms_users", in_={"id": sorted({e["student_id"] for e in enroll})})}
+    roster: dict[str, list] = {cid: [] for cid in cids}
+    for e in enroll:
+        u = students.get(e["student_id"])
+        if u:
+            roster[e["course_id"]].append({"id": u["id"], "name": u["name"], "login_id": u["login_id"]})
+    for rows in roster.values():
+        rows.sort(key=lambda s: s["login_id"])
+
+    mats: dict[str, list] = {cid: [] for cid in cids}
+    for m in b.select("lms_materials", in_={"course_id": cids}):
+        mats[m["course_id"]].append(_material(m))
+
+    asg_raw = sorted(b.select("lms_assignments", in_={"course_id": cids}), key=lambda a: a["id"])
+    subs_by: dict[str, list] = {}
+    for s in sorted(b.select("lms_submissions", in_={"assignment_id": [a["id"] for a in asg_raw]}),
+                    key=lambda s: s["id"]):
+        stu = students.get(s["student_id"], {})
+        subs_by.setdefault(s["assignment_id"], []).append({
+            "id": s["id"], "student_id": s["student_id"], "student_name": stu.get("name", "?"),
+            "login_id": stu.get("login_id", ""), "status": s["status"], "score": s["score"],
+            "late": bool(s.get("late")), "submitted_at": _to_date(s["submitted_at"])})
+    asg: dict[str, list] = {cid: [] for cid in cids}
+    for a in asg_raw:
+        submissions = subs_by.get(a["id"], [])
+        done = {s["student_id"] for s in submissions}
+        asg[a["course_id"]].append({
+            "id": a["id"], "title": a["title"], "due": _to_date(a["due"]), "points": a["points"],
+            "submissions": submissions,
+            "missing": [s for s in roster[a["course_id"]] if s["id"] not in done]})
+
+    attendance: dict[str, dict] = {cid: {} for cid in cids}
+    for r in b.select("lms_attendance", in_={"course_id": cids}):
+        attendance[r["course_id"]].setdefault(r["student_id"], {})[r["week"]] = r["status"]
+
+    courses = [{
+        "id": c["id"], "title": c["title"], "professor": user["name"], "schedule": c["schedule"],
+        "room": c["room"], "roster": roster[c["id"]],
+        "materials": sorted(mats[c["id"]], key=lambda m: m["week"]),
+        "assignments": asg[c["id"]],
+    } for c in courses_raw]
+
+    announcements = [_announcement(a) for a in b.select("lms_announcements", in_={"course_id": cids})]
+    colors, codes = _course_meta(courses_raw)
+    return {
+        "user": user,
+        "professor": {"name": user["name"], "login_id": user["login_id"],
+                      "department": user["department"], "semester": user["semester"]},
+        "courses": courses, "attendance": attendance, "announcements": announcements,
+        "qna": _qna_posts(b, cids), "card_colors": colors, "course_code": codes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 쓰기 — 공통 권한 검사
+# ---------------------------------------------------------------------------
+def _require(user: dict, role: str) -> None:
+    if not user or user.get("role") != role:
+        raise PermissionDenied(f"{role} 권한이 필요합니다.")
+
+
+def _own_course(b, user: dict, course_id: str) -> dict:
+    """교수가 담당하는 과목인지 확인하고 과목 행을 돌려준다."""
+    _require(user, "professor")
+    rows = b.select("lms_courses", eq={"id": course_id})
+    if not rows or rows[0].get("professor_id") != user["id"]:
+        raise PermissionDenied("담당 과목이 아닙니다.")
+    return rows[0]
+
+
+def _enrolled(b, user: dict, course_id: str) -> None:
+    _require(user, "student")
+    if not b.select("lms_enrollments", eq={"course_id": course_id, "student_id": user["id"]}):
+        raise PermissionDenied("수강 중인 과목이 아닙니다.")
+
+
+# ---------------------------------------------------------------------------
+# 쓰기 — 학생
+# ---------------------------------------------------------------------------
+def submit_assignment(user: dict, assignment_id: str, on_date: date) -> None:
+    b = _backend()
+    rows = b.select("lms_assignments", eq={"id": assignment_id})
+    if not rows:
+        raise ValueError("존재하지 않는 과제입니다.")
+    asg = rows[0]
+    _enrolled(b, user, asg["course_id"])
+    existing = b.select("lms_submissions", eq={"assignment_id": assignment_id, "student_id": user["id"]})
+    if existing:  # 이미 제출했으면 중복 생성하지 않는다(채점된 건 되돌리지 않음).
+        return
+    b.insert("lms_submissions", {
+        "assignment_id": assignment_id, "student_id": user["id"], "status": "submitted",
+        "score": None, "late": on_date > _to_date(asg["due"]), "submitted_at": on_date})
+
+
+def check_attendance(user: dict, course_id: str, week: int, on_date: date, status: str = "present") -> None:
+    b = _backend()
+    _enrolled(b, user, course_id)
+    _upsert_attendance(b, course_id, user["id"], week, on_date, status)
+
+
+def watch_lecture(user: dict, lecture_id: int) -> None:
+    b = _backend()
+    lec = b.select("lms_lectures", eq={"id": lecture_id})
+    if not lec:
+        raise ValueError("존재하지 않는 강의입니다.")
+    _enrolled(b, user, lec[0]["course_id"])
+    cur = b.select("lms_lecture_progress", eq={"lecture_id": lecture_id, "student_id": user["id"]})
+    if cur:
+        b.update("lms_lecture_progress", {"watched_pct": 100}, {"id": cur[0]["id"]})
     else:
-        student = copy.deepcopy(sample.DEMO_STUDENT)
-
-    return {
-        "courses": courses,
-        "attendance": attendance,
-        "qna": qna,
-        "lectures": lectures,
-        "announcements": announcements,
-        "exams": exams,
-        "student": student,
-        "card_colors": card_colors,
-        "course_code": course_code,
-    }
+        b.insert("lms_lecture_progress", {"lecture_id": lecture_id, "student_id": user["id"], "watched_pct": 100})
 
 
-def _load_from_sample() -> dict:
-    return {
-        "courses": copy.deepcopy(sample.COURSES),
-        "attendance": copy.deepcopy(sample.ATTENDANCE),
-        "qna": copy.deepcopy(sample.QNA),
-        "lectures": copy.deepcopy(sample.LECTURES),
-        "announcements": copy.deepcopy(sample.ANNOUNCEMENTS),
-        "exams": copy.deepcopy(sample.EXAMS),
-        "student": copy.deepcopy(sample.DEMO_STUDENT),
-        "card_colors": copy.deepcopy(sample.CARD_COLORS),
-        "course_code": copy.deepcopy(sample.COURSE_CODE),
-    }
-
-
-def load_all() -> dict:
-    """앱이 쓰는 모든 데이터를 한 번에 로드. 실패 시 샘플로 폴백."""
-    client = _client()
-    if client is None:
-        return _load_from_sample()
-    try:
-        return _load_from_db(client)
-    except Exception as exc:  # 네트워크/권한 문제 등 — 데모가 멈추지 않게 폴백.
-        st.session_state["_db_error"] = str(exc)
-        return _load_from_sample()
+def add_question(user: dict, course_id: str, title: str, body: str, on_date: date) -> None:
+    b = _backend()
+    _enrolled(b, user, course_id)
+    b.insert("lms_qna", {"course_id": course_id, "author_id": user["id"], "author": user["name"],
+                         "title": title, "body": body, "posted": on_date, "answered": False})
 
 
 # ---------------------------------------------------------------------------
-# 쓰기 — 연결돼 있을 때만 수행(폴백 모드에서는 호출부가 세션을 직접 수정).
+# 쓰기 — 교수
 # ---------------------------------------------------------------------------
-def _iso(d) -> str:
-    return d.isoformat() if hasattr(d, "isoformat") else str(d)
+def _upsert_attendance(b, course_id: str, student_id: int, week: int, on_date: date, status: str) -> None:
+    if status not in ("present", "late", "absent"):
+        raise ValueError("잘못된 출석 상태입니다.")
+    cur = b.select("lms_attendance", eq={"course_id": course_id, "student_id": student_id, "week": week})
+    if cur:
+        b.update("lms_attendance", {"status": status}, {"id": cur[0]["id"]})
+    else:
+        b.insert("lms_attendance", {"course_id": course_id, "student_id": student_id, "week": week,
+                                    "date": on_date, "status": status})
 
 
-def submit_assignment(assignment_id: str) -> bool:
-    client = _client()
-    if client is None:
-        return False
-    client.table("lms_assignments").update({"status": "submitted"}).eq(
-        "id", assignment_id
-    ).execute()
-    return True
+def set_attendance(user: dict, course_id: str, student_id: int, week: int, on_date: date, status: str) -> None:
+    b = _backend()
+    _own_course(b, user, course_id)
+    if not b.select("lms_enrollments", eq={"course_id": course_id, "student_id": student_id}):
+        raise PermissionDenied("수강생이 아닙니다.")
+    _upsert_attendance(b, course_id, student_id, week, on_date, status)
 
 
-def check_attendance(course_id: str, week: int, on_date, status: str = "present") -> bool:
-    client = _client()
-    if client is None:
-        return False
-    client.table("lms_attendance").insert(
-        {"course_id": course_id, "week": week, "date": _iso(on_date), "status": status}
-    ).execute()
-    return True
+def post_announcement(user: dict, course_id: str, title: str, body: str, pinned: bool, on_date: date) -> None:
+    b = _backend()
+    _own_course(b, user, course_id)
+    b.insert("lms_announcements", {"course_id": course_id, "author_id": user["id"], "title": title,
+                                   "body": body, "posted": on_date, "pinned": pinned})
 
 
-def watch_lecture(lecture_id: int) -> bool:
-    client = _client()
-    if client is None:
-        return False
-    client.table("lms_lectures").update({"watched_pct": 100}).eq("id", lecture_id).execute()
-    return True
+def add_material(user: dict, course_id: str, week: int, title: str, kind: str, size_kb: int, on_date: date) -> None:
+    b = _backend()
+    _own_course(b, user, course_id)
+    b.insert("lms_materials", {"course_id": course_id, "week": week, "title": title, "type": kind,
+                               "size_kb": size_kb, "posted": on_date})
 
 
-def add_question(course_id: str, title: str, body: str, on_date) -> bool:
-    client = _client()
-    if client is None:
-        return False
-    client.table("lms_qna").insert(
-        {
-            "course_id": course_id,
-            "author": "학생",
-            "title": title,
-            "body": body,
-            "posted": _iso(on_date),
-            "answered": False,
-        }
-    ).execute()
-    return True
+def create_assignment(user: dict, course_id: str, title: str, due: date, points: int) -> str:
+    b = _backend()
+    _own_course(b, user, course_id)
+    nums = []
+    for a in b.select("lms_assignments", eq={"course_id": course_id}):
+        tail = a["id"].rsplit("-A", 1)[-1]
+        if tail.isdigit():
+            nums.append(int(tail))
+    new_id = f"{course_id}-A{max(nums, default=0) + 1}"
+    b.insert("lms_assignments", {"id": new_id, "course_id": course_id, "title": title,
+                                 "due": due, "points": points})
+    return new_id
+
+
+def grade_submission(user: dict, submission_id: int, score: int) -> None:
+    b = _backend()
+    sub = b.select("lms_submissions", eq={"id": submission_id})
+    if not sub:
+        raise ValueError("존재하지 않는 제출물입니다.")
+    asg = b.select("lms_assignments", eq={"id": sub[0]["assignment_id"]})[0]
+    _own_course(b, user, asg["course_id"])
+    if not 0 <= score <= asg["points"]:
+        raise ValueError(f"점수는 0~{asg['points']} 사이여야 합니다.")
+    b.update("lms_submissions", {"status": "graded", "score": score}, {"id": submission_id})
+
+
+def answer_question(user: dict, qna_id: int, body: str) -> None:
+    b = _backend()
+    q = b.select("lms_qna", eq={"id": qna_id})
+    if not q:
+        raise ValueError("존재하지 않는 질문입니다.")
+    _own_course(b, user, q[0]["course_id"])
+    b.insert("lms_qna_replies", {"qna_id": qna_id, "author_id": user["id"],
+                                 "author": f"{user['name']} 교수", "body": body})
+    b.update("lms_qna", {"answered": True}, {"id": qna_id})
