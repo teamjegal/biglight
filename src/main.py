@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import os
+
 import streamlit as st
 
 import admin
@@ -90,6 +92,9 @@ def _login_tab() -> None:
     if submitted:
         _attempt_login(login_id, password, role)
 
+    # 공개 배포에서는 HIDE_DEMO_LOGINS=1 로 숨긴다(버튼 하나로 관리자 로그인이 되므로).
+    if os.environ.get("HIDE_DEMO_LOGINS") == "1":
+        return
     st.divider()
     st.caption("데모 계정으로 바로 둘러보기")
     c1, c2, c3 = st.columns(3)

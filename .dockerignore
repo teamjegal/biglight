@@ -1,0 +1,21 @@
+# 이미지에 들어가면 안 되는 것: 비밀 값, 로컬 환경, 개발 산출물
+.git
+.github
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+
+# 비밀 값 — 절대 이미지에 넣지 않는다(호스트 환경 변수로 주입)
+.env
+.env.*
+.streamlit/secrets.toml
+
+# 런타임에 필요 없는 것
+tests
+docs
+supabase
+pitch.html
+.arena
+.claude

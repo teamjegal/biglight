@@ -74,6 +74,22 @@ def test_starts_at_login_page(monkeypatch):
     assert [t.label for t in at.text_input][:2] ==["학번", "비밀번호"]
 
 
+def test_demo_buttons_are_shown_by_default(monkeypatch):
+    monkeypatch.delenv("HIDE_DEMO_LOGINS", raising=False)
+    at = _app(monkeypatch)
+    assert {STUDENT_BTN, PROFESSOR_BTN, ADMIN_BTN} <= {b.label for b in at.button}
+
+
+def test_demo_buttons_hidden_for_public_deploy(monkeypatch):
+    monkeypatch.setenv("HIDE_DEMO_LOGINS", "1")
+    at = _app(monkeypatch)
+    labels = {b.label for b in at.button}
+    assert not ({STUDENT_BTN, PROFESSOR_BTN, ADMIN_BTN} & labels)
+    # 일반 로그인·회원가입은 그대로 동작한다.
+    assert {"로그인", "회원가입"} <= labels
+    assert "user" not in at.session_state
+
+
 def test_professor_tab_asks_for_employee_id(monkeypatch):
     at = _app(monkeypatch)
     at.radio[0].set_value("교수").run()
