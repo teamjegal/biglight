@@ -26,8 +26,10 @@ PROFESSOR_PAGES = [
     "내 강의", "대시보드", "공지 관리", "자료 관리", "과제·채점",
     "출석 관리", "Q&A 답변", "시간표",
 ]
-STUDENT_BTN = "🎒 학생으로 시작"
-PROFESSOR_BTN = "🧑‍🏫 교수로 시작"
+ADMIN_PAGES = ["대시보드", "교수 관리", "강의 관리"]
+STUDENT_BTN = "🎒 학생"
+PROFESSOR_BTN = "🧑‍🏫 교수"
+ADMIN_BTN = "🛠️ 관리자"
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +48,8 @@ def _click(at: AppTest, label: str) -> AppTest:
 
 
 def _demo_login(at: AppTest, role: str) -> AppTest:
-    return _click(at, STUDENT_BTN if role == "student" else PROFESSOR_BTN)
+    label = {"student": STUDENT_BTN, "professor": PROFESSOR_BTN, "admin": ADMIN_BTN}[role]
+    return _click(at, label)
 
 
 def _goto(at: AppTest, page: str) -> AppTest:
@@ -183,7 +186,10 @@ def mem(monkeypatch):
 
 
 def _user(login_id: str) -> dict:
-    password = {"P": "prof1234"}.get(login_id[0], "student1234")
+    if login_id == "admin":
+        password = "admin1234"
+    else:
+        password = {"P": "prof1234"}.get(login_id[0], "student1234")
     user = db.login(login_id, password)
     assert user is not None
     return user
@@ -259,3 +265,152 @@ def test_professor_answer_marks_question_answered(mem):
 
 def test_create_assignment_gets_next_id(mem):
     assert db.create_assignment(_user("P2001"), "CSE311", "신규", date(2026, 5, 1), 10) == "CSE311-A4"
+
+
+# ---------------------------------------------------------------------------
+# 관리자: 로그인 탭, 화면, 교수 계정 생성
+# ---------------------------------------------------------------------------
+ADMIN_PW = sample.DEMO_LOGINS["admin"][1]
+
+
+def _fill_new_professor(at: AppTest, login_id: str, name: str, password: str, admin_pw: str,
+                        n: int = 0) -> AppTest:
+    at.text_input(key=f"prof-id-{n}").set_value(login_id)
+    at.text_input(key=f"prof-name-{n}").set_value(name)
+    at.text_input(key=f"prof-dept-{n}").set_value("수학과")
+    at.text_input(key=f"prof-pw-{n}").set_value(password)
+    at.text_input(key=f"prof-admin-pw-{n}").set_value(admin_pw)
+    return _click(at, "교수 계정 만들기")
+
+
+def test_admin_tab_asks_for_admin_id(monkeypatch):
+    at = _app(monkeypatch)
+    at.radio[0].set_value("관리자").run()
+    assert [t.label for t in at.text_input] == ["관리자 ID", "비밀번호"]
+
+
+def test_professor_cannot_login_on_admin_tab(monkeypatch):
+    at = _form_login(_app(monkeypatch), "관리자", "P2001", "prof1234")
+    assert "user" not in at.session_state
+    assert any("관리자 계정이 아닙니다" in e.value for e in at.error)
+
+
+@pytest.mark.parametrize("page", ADMIN_PAGES)
+def test_admin_page_renders(monkeypatch, page):
+    at = _goto(_demo_login(_app(monkeypatch), "admin"), page)
+    assert not at.exception, f"관리자 {page} 페이지 예외"
+
+
+def test_admin_menu_is_separate_from_other_roles(monkeypatch):
+    at = _demo_login(_app(monkeypatch), "admin")
+    menu = {o.split(" ", 1)[1] for o in at.radio[0].options}
+    assert menu == set(ADMIN_PAGES)
+
+
+def test_admin_creates_professor_who_can_then_login(monkeypatch):
+    at = _goto(_demo_login(_app(monkeypatch), "admin"), "교수 관리")
+    at = _fill_new_professor(at, "P3001", "테스트교수", "newprof1234", ADMIN_PW)
+    assert not at.error and not at.exception
+    assert "P3001" in [p["login_id"] for p in at.session_state["adata"]["professors"]]
+
+    # 새 교수로 로그인하면 담당 강의가 0개여도 모든 교수 화면이 깨지지 않는다.
+    at = _click(at, "로그아웃")
+    at = _form_login(at, "교수", "P3001", "newprof1234")
+    assert at.session_state["user"]["name"] == "테스트교수"
+    for page in PROFESSOR_PAGES:
+        at = _goto(at, page)
+        assert not at.exception, f"새 교수 {page} 페이지 예외"
+
+
+def test_admin_wrong_password_does_not_create_professor(monkeypatch):
+    at = _goto(_demo_login(_app(monkeypatch), "admin"), "교수 관리")
+    at = _fill_new_professor(at, "P3002", "테스트교수", "newprof1234", "wrong-password")
+    assert any("관리자 비밀번호가 올바르지 않습니다" in e.value for e in at.error)
+    assert "P3002" not in [p["login_id"] for p in at.session_state["adata"]["professors"]]
+
+
+# ---------------------------------------------------------------------------
+# 관리자: DB 계층 (메모리 백엔드)
+# ---------------------------------------------------------------------------
+def test_new_courses_have_five_materials_each(mem):
+    expected = {"MAT101": "P2004", "ECE201": "P2005", "CSE330": "P2006", "BUS110": "P2007", "ENG201": "P2008"}
+    for course_id, prof in expected.items():
+        view = db.load_professor(_user(prof))
+        assert [c["id"] for c in view["courses"]] == [course_id]
+        assert len(view["courses"][0]["materials"]) == 5
+
+
+def test_load_admin_reports_totals(mem):
+    stats = db.load_admin(_user("admin"))["stats"]
+    assert stats == {"professors": 8, "students": 3, "courses": 8, "materials": 37}
+
+
+def test_only_admin_can_use_admin_actions(mem):
+    for who in ("P2001", "202512345"):
+        user = _user(who)
+        with pytest.raises(db.PermissionDenied):
+            db.load_admin(user)
+        with pytest.raises(db.PermissionDenied):
+            db.create_professor(user, ADMIN_PW, "P9001", "longenough1", "x", "y")
+        with pytest.raises(db.PermissionDenied):
+            db.create_course(user, "ABC101", "x", 1, "", "")
+        with pytest.raises(db.PermissionDenied):
+            db.assign_professor(user, "CSE311", 2)
+
+
+def test_create_professor_needs_correct_admin_password(mem):
+    with pytest.raises(db.PermissionDenied):
+        db.create_professor(_user("admin"), "wrong", "P9001", "longenough1", "이름", "학과")
+    assert db.login("P9001", "longenough1") is None
+
+
+def test_create_professor_validates_input(mem):
+    admin = _user("admin")
+    with pytest.raises(ValueError):  # 사번 중복
+        db.create_professor(admin, ADMIN_PW, "P2001", "longenough1", "x", "y")
+    with pytest.raises(ValueError):  # 짧은 비밀번호
+        db.create_professor(admin, ADMIN_PW, "P9001", "short", "x", "y")
+    with pytest.raises(ValueError):  # 사번 형식
+        db.create_professor(admin, ADMIN_PW, "bad id!", "longenough1", "x", "y")
+    with pytest.raises(ValueError):  # 이름 없음
+        db.create_professor(admin, ADMIN_PW, "P9001", "longenough1", "  ", "y")
+
+
+def test_created_account_is_always_professor_and_can_login(mem):
+    db.create_professor(_user("admin"), ADMIN_PW, "P9001", "longenough1", "신규교수", "수학과")
+    user = db.login("P9001", "longenough1")
+    assert user["role"] == "professor" and user["name"] == "신규교수"
+
+
+def test_create_course_then_professor_sees_it(mem):
+    admin, prof = _user("admin"), _user("P2004")
+    assert db.create_course(admin, "abc101", "신규 강의", prof["id"], "월 09:00", "101호") == "ABC101"
+    assert [c["id"] for c in db.load_professor(prof)["courses"]] == ["MAT101", "ABC101"]
+
+
+def test_create_course_validates_input(mem):
+    admin = _user("admin")
+    pid = _user("P2004")["id"]
+    with pytest.raises(ValueError):  # 코드 형식
+        db.create_course(admin, "1234", "x", pid, "", "")
+    with pytest.raises(ValueError):  # 코드 중복
+        db.create_course(admin, "CSE311", "x", pid, "", "")
+    with pytest.raises(ValueError):  # 강의명 없음
+        db.create_course(admin, "ABC101", " ", pid, "", "")
+    with pytest.raises(ValueError):  # 담당자가 학생
+        db.create_course(admin, "ABC101", "x", _user("202512345")["id"], "", "")
+
+
+def test_assign_professor_moves_course(mem):
+    admin, old, new = _user("admin"), _user("P2004"), _user("P2005")
+    db.assign_professor(admin, "MAT101", new["id"])
+    assert [c["id"] for c in db.load_professor(old)["courses"]] == []
+    assert "MAT101" in [c["id"] for c in db.load_professor(new)["courses"]]
+
+
+def test_assign_professor_rejects_non_professor_and_unknown_course(mem):
+    admin = _user("admin")
+    with pytest.raises(ValueError):
+        db.assign_professor(admin, "MAT101", _user("202512345")["id"])
+    with pytest.raises(ValueError):
+        db.assign_professor(admin, "NOPE999", _user("P2004")["id"])

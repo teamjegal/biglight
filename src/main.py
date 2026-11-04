@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import streamlit as st
 
+import admin
 import professor
 import ui
 from data import db
@@ -35,8 +36,9 @@ NAV_ITEMS = [
     ("Q&A 게시판", "💬"),
 ]
 
-ROLE_TABS = {"학생": "student", "교수": "professor"}
-ROLE_NAMES = {"student": "학생", "professor": "교수"}
+ROLE_TABS = {"학생": "student", "교수": "professor", "관리자": "admin"}
+ROLE_NAMES = {"student": "학생", "professor": "교수", "admin": "관리자"}
+ID_LABELS = {"student": "학번", "professor": "사번", "admin": "관리자 ID"}
 
 
 # ----------------------------------------------------------------------------
@@ -67,10 +69,9 @@ def login_page() -> None:
 
         tab = st.radio("로그인 유형", list(ROLE_TABS), horizontal=True)
         role = ROLE_TABS[tab]
-        id_label = "학번" if role == "student" else "사번"
 
         with st.form("login_form"):
-            login_id = st.text_input(id_label)
+            login_id = st.text_input(ID_LABELS[role])
             password = st.text_input("비밀번호", type="password")
             submitted = st.form_submit_button("로그인", type="primary", use_container_width=True)
         if submitted:
@@ -78,11 +79,13 @@ def login_page() -> None:
 
         st.divider()
         st.caption("데모 계정으로 바로 둘러보기")
-        c1, c2 = st.columns(2)
-        if c1.button("🎒 학생으로 시작", use_container_width=True):
+        c1, c2, c3 = st.columns(3)
+        if c1.button("🎒 학생", use_container_width=True):
             _attempt_login(*DEMO_LOGINS["student"], "student")
-        if c2.button("🧑‍🏫 교수로 시작", use_container_width=True):
+        if c2.button("🧑‍🏫 교수", use_container_width=True):
             _attempt_login(*DEMO_LOGINS["professor"], "professor")
+        if c3.button("🛠️ 관리자", use_container_width=True):
+            _attempt_login(*DEMO_LOGINS["admin"], "admin")
 
         if not db.is_connected():
             st.caption("🟠 샘플 데이터 모드(백엔드 미연결)")
@@ -485,8 +488,11 @@ def main() -> None:
         login_page()
         return
 
+    role = user["role"]
     try:
-        if user["role"] == "professor":
+        if role == "admin":
+            admin.load(user)
+        elif role == "professor":
             professor.load(user)
         else:
             load_student_state(user)
@@ -496,7 +502,10 @@ def main() -> None:
             ui.logout()
         st.stop()
 
-    if user["role"] == "professor":
+    if role == "admin":
+        admin.run()
+        return
+    if role == "professor":
         professor.run()
         return
 

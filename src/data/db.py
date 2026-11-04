@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import copy
 import os
+import re
+from collections import Counter
 from datetime import date, datetime
 
 import streamlit as st
@@ -97,6 +99,26 @@ class _SupabaseBackend:
         data = self.c.rpc("lms_login", {"p_login_id": login_id, "p_password": password}).execute().data
         return data[0] if data else None
 
+    def create_user(self, admin_login_id: str, admin_password: str, row: dict) -> int:
+        """교수 계정 생성. 관리자 자격은 DB 함수가 호출마다 다시 검증한다."""
+        try:
+            res = self.c.rpc("lms_admin_create_user", {
+                "p_admin_id": admin_login_id, "p_admin_password": admin_password,
+                "p_login_id": row["login_id"], "p_password": row["password"],
+                "p_name": row["name"], "p_department": row.get("department") or "",
+                "p_semester": row.get("semester") or "",
+            }).execute()
+        except Exception as exc:  # postgrest APIError — SQLSTATE 로 원인을 구분한다.
+            code = getattr(exc, "code", None)
+            if code == "42501":
+                raise PermissionDenied("관리자 비밀번호가 올바르지 않습니다.") from exc
+            if code == "23505":
+                raise ValueError("이미 사용 중인 사번입니다.") from exc
+            if code == "22023":
+                raise ValueError("입력값이 올바르지 않습니다.") from exc
+            raise
+        return res.data
+
 
 class _MemoryBackend:
     """샘플 데이터를 세션 상태에 두고 같은 인터페이스로 읽고 쓴다."""
@@ -139,6 +161,22 @@ class _MemoryBackend:
             if u["login_id"] == login_id and u["password"] == password:
                 return self._public("lms_users", u)
         return None
+
+    def create_user(self, admin_login_id: str, admin_password: str, row: dict) -> int:
+        """Supabase 의 lms_admin_create_user 와 같은 규칙(샘플 모드용)."""
+        users = self.t["lms_users"]
+        if not any(u["login_id"] == admin_login_id and u["role"] == "admin"
+                   and u["password"] == admin_password for u in users):
+            raise PermissionDenied("관리자 비밀번호가 올바르지 않습니다.")
+        login_id, name = row["login_id"].strip(), row["name"].strip()
+        if len(row["password"]) < 8 or not login_id or not name:
+            raise ValueError("입력값이 올바르지 않습니다.")
+        if any(u["login_id"] == login_id for u in users):
+            raise ValueError("이미 사용 중인 사번입니다.")
+        return self.insert("lms_users", {
+            "login_id": login_id, "password": row["password"], "role": "professor", "name": name,
+            "department": (row.get("department") or "").strip() or None,
+            "semester": row.get("semester") or None})["id"]
 
 
 def _backend():
@@ -475,3 +513,99 @@ def answer_question(user: dict, qna_id: int, body: str) -> None:
     b.insert("lms_qna_replies", {"qna_id": qna_id, "author_id": user["id"],
                                  "author": f"{user['name']} 교수", "body": body})
     b.update("lms_qna", {"answered": True}, {"id": qna_id})
+
+
+# ---------------------------------------------------------------------------
+# 관리자
+# ---------------------------------------------------------------------------
+COURSE_PALETTE = ["#3b5bdb", "#2f9e44", "#e8590c", "#7048e8", "#0c8599", "#c2255c", "#5c940d", "#e67700"]
+LOGIN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{3,20}$")
+COURSE_ID_RE = re.compile(r"^[A-Z]{2,4}\d{3}$")
+MIN_PASSWORD = 8
+
+
+def load_admin(user: dict) -> dict:
+    """관리자 화면용 데이터: 전체 교수·강의 현황."""
+    _require(user, "admin")
+    b = _backend()
+    users = b.select("lms_users")
+    professors = sorted((u for u in users if u["role"] == "professor"), key=lambda u: u["login_id"])
+    n_students = sum(1 for u in users if u["role"] == "student")
+    courses_raw = sorted(b.select("lms_courses"), key=lambda c: c.get("sort_order") or 0)
+    enrolled = Counter(e["course_id"] for e in b.select("lms_enrollments"))
+    materials = Counter(m["course_id"] for m in b.select("lms_materials"))
+    teaching = Counter(c["professor_id"] for c in courses_raw)
+    names = {u["id"]: u["name"] for u in professors}
+    return {
+        "user": user,
+        "admin": {"name": user["name"], "login_id": user["login_id"],
+                  "department": user["department"], "semester": user["semester"]},
+        "professors": [{"id": u["id"], "login_id": u["login_id"], "name": u["name"],
+                        "department": u["department"], "courses": teaching.get(u["id"], 0)}
+                       for u in professors],
+        "courses": [{"id": c["id"], "title": c["title"], "professor_id": c["professor_id"],
+                     "professor": names.get(c["professor_id"], "(미배정)"), "schedule": c["schedule"],
+                     "room": c["room"], "students": enrolled.get(c["id"], 0),
+                     "materials": materials.get(c["id"], 0)} for c in courses_raw],
+        "stats": {"professors": len(professors), "students": n_students,
+                  "courses": len(courses_raw), "materials": sum(materials.values())},
+    }
+
+
+def _professor_row(b, professor_id: int) -> dict:
+    rows = b.select("lms_users", eq={"id": professor_id})
+    if not rows or rows[0]["role"] != "professor":
+        raise ValueError("교수 계정을 선택하세요.")
+    return rows[0]
+
+
+def create_professor(user: dict, admin_password: str, login_id: str, password: str,
+                     name: str, department: str) -> int:
+    """교수 계정을 만든다. 관리자 비밀번호를 서버가 다시 검증한다."""
+    _require(user, "admin")
+    login_id, name = (login_id or "").strip(), (name or "").strip()
+    if not LOGIN_ID_RE.match(login_id):
+        raise ValueError("사번은 영문·숫자·-·_ 3~20자로 입력하세요.")
+    if not name:
+        raise ValueError("이름을 입력하세요.")
+    if len(password or "") < MIN_PASSWORD:
+        raise ValueError(f"비밀번호는 {MIN_PASSWORD}자 이상이어야 합니다.")
+    if not admin_password:
+        raise ValueError("관리자 비밀번호를 입력하세요.")
+    return _backend().create_user(
+        user["login_id"], admin_password,
+        {"login_id": login_id, "password": password, "name": name,
+         "department": (department or "").strip(), "semester": user.get("semester")})
+
+
+def create_course(user: dict, course_id: str, title: str, professor_id: int,
+                  schedule: str, room: str) -> str:
+    """새 강의를 열고 담당 교수를 배정한다."""
+    _require(user, "admin")
+    b = _backend()
+    course_id, title = (course_id or "").strip().upper(), (title or "").strip()
+    if not COURSE_ID_RE.match(course_id):
+        raise ValueError("강의 코드는 영문 대문자 2~4자 + 숫자 3자리(예: CSE101)로 입력하세요.")
+    if not title:
+        raise ValueError("강의명을 입력하세요.")
+    _professor_row(b, professor_id)
+    existing = b.select("lms_courses")
+    if any(c["id"] == course_id for c in existing):
+        raise ValueError("이미 있는 강의 코드입니다.")
+    n = len(existing)
+    b.insert("lms_courses", {
+        "id": course_id, "title": title, "professor_id": professor_id,
+        "schedule": (schedule or "").strip() or None, "room": (room or "").strip() or None,
+        "card_color": COURSE_PALETTE[n % len(COURSE_PALETTE)], "course_code": f"9{n + 1:09d}",
+        "sort_order": max((c.get("sort_order") or 0 for c in existing), default=0) + 1})
+    return course_id
+
+
+def assign_professor(user: dict, course_id: str, professor_id: int) -> None:
+    """강의의 담당 교수를 바꾼다."""
+    _require(user, "admin")
+    b = _backend()
+    if not b.select("lms_courses", eq={"id": course_id}):
+        raise ValueError("존재하지 않는 강의입니다.")
+    _professor_row(b, professor_id)
+    b.update("lms_courses", {"professor_id": professor_id}, {"id": course_id})
