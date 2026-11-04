@@ -153,3 +153,63 @@ insert into lms_qna (course_id, author_id, author, title, body, posted, answered
 select 'CSE245', u.id, u.name, 'BST 중복 키 처리',
        '이진 탐색 트리에 중복 키가 들어오면 어떻게 처리하나요?', '2026-04-12', false
 from lms_users u where u.login_id = '202512346';
+
+-- ===========================================================================
+-- 관리자 · 추가 교수 5명 · 새 강의 5개 · 강의 자료 (이 섹션만 따로 실행해도 안전 — 중복 방지)
+--   관리자  admin          → 비밀번호 admin1234
+--   교수    P2004 ~ P2008   → 비밀번호 prof1234
+-- 새 강의에는 수강생이 없다(자료만 채움). 공개 데모 계정이니 실계정에 쓰지 말 것.
+-- ===========================================================================
+insert into lms_users (login_id, password_hash, role, name, department, semester) values
+  ('admin', extensions.crypt('admin1234', extensions.gen_salt('bf')), 'admin', '관리자', '교무처', '2026학년도 1학기'),
+  ('P2004', extensions.crypt('prof1234', extensions.gen_salt('bf')), 'professor', '윤서준', '수학과', '2026학년도 1학기'),
+  ('P2005', extensions.crypt('prof1234', extensions.gen_salt('bf')), 'professor', '장유진', '전자공학과', '2026학년도 1학기'),
+  ('P2006', extensions.crypt('prof1234', extensions.gen_salt('bf')), 'professor', '임도현', '컴퓨터공학과', '2026학년도 1학기'),
+  ('P2007', extensions.crypt('prof1234', extensions.gen_salt('bf')), 'professor', '신예린', '경영학과', '2026학년도 1학기'),
+  ('P2008', extensions.crypt('prof1234', extensions.gen_salt('bf')), 'professor', '백승우', '영어영문학과', '2026학년도 1학기')
+on conflict (login_id) do nothing;
+
+insert into lms_courses (id, title, professor_id, schedule, room, card_color, course_code, sort_order)
+select v.id, v.title, u.id, v.schedule, v.room, v.color, v.code, v.ord
+from (values
+  ('MAT101', '미적분학', 'P2004', '월·수 09:00–10:15', '자연관 301', '#7048e8', '0002014001', 4),
+  ('ECE201', '디지털논리회로', 'P2005', '화·목 10:30–11:45', '공학관 305', '#0c8599', '0002021002', 5),
+  ('CSE330', '데이터베이스', 'P2006', '월·수 13:00–14:15', '공학관 502', '#c2255c', '0001783003', 6),
+  ('BUS110', '경영학원론', 'P2007', '화·목 09:00–10:15', '경상관 210', '#5c940d', '0002037004', 7),
+  ('ENG201', '영어 프레젠테이션', 'P2008', '금 13:00–15:45', '인문관 220', '#e67700', '0002044005', 8)
+) v(id, title, prof, schedule, room, color, code, ord)
+join lms_users u on u.login_id = v.prof
+on conflict (id) do nothing;
+
+insert into lms_materials (course_id, week, title, type, size_kb, posted)
+select v.c, v.w, v.t, v.ty, v.kb, date '2026-03-09' + 7 * (v.w - 1)
+from (values
+  ('MAT101', 1, '극한과 연속', 'PDF', 1320),
+  ('MAT101', 2, '미분의 정의와 규칙', 'PDF', 1890),
+  ('MAT101', 3, '평균값 정리', '슬라이드', 2210),
+  ('MAT101', 4, '미분의 응용', 'PDF', 2050),
+  ('MAT101', 5, '부정적분과 치환적분', 'PDF', 1760),
+  ('ECE201', 1, '논리 게이트 기초', 'PDF', 1100),
+  ('ECE201', 2, '부울 대수와 카르노 맵', '슬라이드', 2480),
+  ('ECE201', 3, '조합 논리 회로 설계', 'PDF', 1950),
+  ('ECE201', 4, '플립플롭과 래치', 'PDF', 2230),
+  ('ECE201', 5, '순차 회로와 상태도', '슬라이드', 2670),
+  ('CSE330', 1, '데이터베이스 개요', 'PDF', 1450),
+  ('CSE330', 2, '관계형 모델과 관계 대수', 'PDF', 1980),
+  ('CSE330', 3, 'SQL 기초', '슬라이드', 2890),
+  ('CSE330', 4, '정규화', 'PDF', 2120),
+  ('CSE330', 5, '트랜잭션과 동시성 제어', 'PDF', 2540),
+  ('BUS110', 1, '경영학이란 무엇인가', 'PDF', 980),
+  ('BUS110', 2, '기업의 형태와 환경', 'PDF', 1230),
+  ('BUS110', 3, '경영 전략의 기초', '슬라이드', 1870),
+  ('BUS110', 4, '마케팅 관리', 'PDF', 1640),
+  ('BUS110', 5, '조직 구조와 리더십', 'PDF', 1510),
+  ('ENG201', 1, '효과적인 발표의 기본', '슬라이드', 1340),
+  ('ENG201', 2, '발표 구조 짜기', 'PDF', 890),
+  ('ENG201', 3, '시각 자료 만들기', '슬라이드', 2760),
+  ('ENG201', 4, '질의응답 대처법', 'PDF', 760),
+  ('ENG201', 5, '발표 리허설 가이드', '영상', 48200)
+) v(c, w, t, ty, kb)
+where not exists (
+  select 1 from lms_materials m where m.course_id = v.c and m.week = v.w
+);
