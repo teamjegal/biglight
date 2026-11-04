@@ -1,0 +1,6 @@
+# Streamlit 설정 (비밀 값 없음 — 비밀은 환경 변수 또는 secrets.toml 로).
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
