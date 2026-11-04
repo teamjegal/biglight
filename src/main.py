@@ -61,31 +61,70 @@ def _attempt_login(login_id: str, password: str, role: str) -> None:
     st.rerun()
 
 
+def _attempt_signup(login_id: str, name: str, department: str, password: str, confirm: str) -> None:
+    """학생 회원가입을 시도하고, 성공하면 바로 로그인한다."""
+    if password != confirm:
+        st.error("비밀번호가 서로 다릅니다.")
+        return
+    try:
+        db.signup_student(login_id, password, name, department)
+        user = db.login(login_id, password)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    except Exception:
+        st.error("서버에 연결하지 못했습니다. 잠시 후 다시 시도하세요.")
+        return
+    st.session_state.user = user
+    st.rerun()
+
+
+def _login_tab() -> None:
+    tab = st.radio("로그인 유형", list(ROLE_TABS), horizontal=True)
+    role = ROLE_TABS[tab]
+
+    with st.form("login_form"):
+        login_id = st.text_input(ID_LABELS[role])
+        password = st.text_input("비밀번호", type="password")
+        submitted = st.form_submit_button("로그인", type="primary", use_container_width=True)
+    if submitted:
+        _attempt_login(login_id, password, role)
+
+    st.divider()
+    st.caption("데모 계정으로 바로 둘러보기")
+    c1, c2, c3 = st.columns(3)
+    if c1.button("🎒 학생", use_container_width=True):
+        _attempt_login(*DEMO_LOGINS["student"], "student")
+    if c2.button("🧑‍🏫 교수", use_container_width=True):
+        _attempt_login(*DEMO_LOGINS["professor"], "professor")
+    if c3.button("🛠️ 관리자", use_container_width=True):
+        _attempt_login(*DEMO_LOGINS["admin"], "admin")
+
+
+def _signup_tab() -> None:
+    st.caption("학생 회원가입입니다. 교수·관리자 계정은 관리자가 발급합니다.")
+    with st.form("signup_form"):
+        login_id = st.text_input("학번", key="su-id", help="숫자 6~12자리")
+        name = st.text_input("이름", key="su-name")
+        department = st.text_input("학과", key="su-dept")
+        password = st.text_input(f"비밀번호 ({db.MIN_PASSWORD}자 이상)", type="password", key="su-pw")
+        confirm = st.text_input("비밀번호 확인", type="password", key="su-pw2")
+        submitted = st.form_submit_button("회원가입", type="primary", use_container_width=True)
+    if submitted:
+        _attempt_signup(login_id, name, department, password, confirm)
+
+
 def login_page() -> None:
     _, mid, _ = st.columns([1, 1.4, 1])
     with mid:
         st.markdown("## 🎓 클래스허브")
         st.caption("학습관리시스템 데모")
 
-        tab = st.radio("로그인 유형", list(ROLE_TABS), horizontal=True)
-        role = ROLE_TABS[tab]
-
-        with st.form("login_form"):
-            login_id = st.text_input(ID_LABELS[role])
-            password = st.text_input("비밀번호", type="password")
-            submitted = st.form_submit_button("로그인", type="primary", use_container_width=True)
-        if submitted:
-            _attempt_login(login_id, password, role)
-
-        st.divider()
-        st.caption("데모 계정으로 바로 둘러보기")
-        c1, c2, c3 = st.columns(3)
-        if c1.button("🎒 학생", use_container_width=True):
-            _attempt_login(*DEMO_LOGINS["student"], "student")
-        if c2.button("🧑‍🏫 교수", use_container_width=True):
-            _attempt_login(*DEMO_LOGINS["professor"], "professor")
-        if c3.button("🛠️ 관리자", use_container_width=True):
-            _attempt_login(*DEMO_LOGINS["admin"], "admin")
+        tab_login, tab_signup = st.tabs(["로그인", "회원가입"])
+        with tab_login:
+            _login_tab()
+        with tab_signup:
+            _signup_tab()
 
         if not db.is_connected():
             st.caption("🟠 샘플 데이터 모드(백엔드 미연결)")
@@ -99,6 +138,14 @@ def load_student_state(user: dict) -> None:
     """학생 한 명의 화면 데이터를 백엔드에서 읽어 세션에 채운다(매 실행마다 새로)."""
     for key, value in db.load_student(user).items():
         st.session_state[key] = value
+
+
+def _no_courses() -> bool:
+    """수강 중인 강의가 없으면(갓 가입한 학생 등) 안내를 보여주고 True 를 돌려준다."""
+    if st.session_state.courses:
+        return False
+    st.info("수강 중인 강의가 없습니다.")
+    return True
 
 
 def find_course(course_id: str) -> dict:
@@ -188,6 +235,8 @@ def page_dashboard() -> None:
 def page_materials() -> None:
     st.title("강의 자료")
     st.caption("주차별 강의 자료를 열람합니다.")
+    if _no_courses():
+        return
 
     titles = {c["title"]: c["id"] for c in st.session_state.courses}
     chosen = st.selectbox("과목 선택", list(titles.keys()))
@@ -356,6 +405,8 @@ def page_announcements() -> None:
 def page_lectures() -> None:
     st.title("온라인 강의")
     st.caption("강의 영상 시청 진도를 확인하고 이어서 봅니다.")
+    if _no_courses():
+        return
 
     titles = {c["title"]: c["id"] for c in st.session_state.courses}
     chosen = st.selectbox("과목 선택", list(titles.keys()))
@@ -428,6 +479,8 @@ def page_grades() -> None:
 def page_qna() -> None:
     st.title("Q&A 게시판")
     st.caption("과목별로 질문을 올리고 답변을 확인합니다.")
+    if _no_courses():
+        return
 
     titles = {c["title"]: c["id"] for c in st.session_state.courses}
     chosen = st.selectbox("과목 선택", list(titles.keys()))

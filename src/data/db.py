@@ -119,6 +119,22 @@ class _SupabaseBackend:
             raise
         return res.data
 
+    def signup_student(self, row: dict) -> int:
+        """학생 회원가입. 서버 함수가 학생 역할 계정만 만든다."""
+        try:
+            res = self.c.rpc("lms_signup_student", {
+                "p_login_id": row["login_id"], "p_password": row["password"],
+                "p_name": row["name"], "p_department": row.get("department") or "",
+            }).execute()
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            if code == "23505":
+                raise ValueError("이미 가입된 학번입니다.") from exc
+            if code == "22023":
+                raise ValueError("입력값이 올바르지 않습니다.") from exc
+            raise
+        return res.data
+
 
 class _MemoryBackend:
     """샘플 데이터를 세션 상태에 두고 같은 인터페이스로 읽고 쓴다."""
@@ -177,6 +193,20 @@ class _MemoryBackend:
             "login_id": login_id, "password": row["password"], "role": "professor", "name": name,
             "department": (row.get("department") or "").strip() or None,
             "semester": row.get("semester") or None})["id"]
+
+    def signup_student(self, row: dict) -> int:
+        """Supabase 의 lms_signup_student 와 같은 규칙(샘플 모드용)."""
+        users = self.t["lms_users"]
+        login_id, name = row["login_id"].strip(), row["name"].strip()
+        if not re.fullmatch(r"[0-9]{6,12}", login_id) or not name or len(name) > 30 \
+                or len(row["password"]) < 8:
+            raise ValueError("입력값이 올바르지 않습니다.")
+        if any(u["login_id"] == login_id for u in users):
+            raise ValueError("이미 가입된 학번입니다.")
+        return self.insert("lms_users", {
+            "login_id": login_id, "password": row["password"], "role": "student", "name": name,
+            "department": (row.get("department") or "").strip() or None,
+            "semester": sample.SEMESTER})["id"]
 
 
 def _backend():
@@ -609,3 +639,23 @@ def assign_professor(user: dict, course_id: str, professor_id: int) -> None:
         raise ValueError("존재하지 않는 강의입니다.")
     _professor_row(b, professor_id)
     b.update("lms_courses", {"professor_id": professor_id}, {"id": course_id})
+
+
+# ---------------------------------------------------------------------------
+# 회원가입 (비로그인 상태에서 호출 — 학생 계정만 만들 수 있다)
+# ---------------------------------------------------------------------------
+STUDENT_ID_RE = re.compile(r"^[0-9]{6,12}$")
+
+
+def signup_student(login_id: str, password: str, name: str, department: str) -> int:
+    """학생 계정을 만든다. 교수·관리자는 이 경로로 만들 수 없다."""
+    login_id, name = (login_id or "").strip(), (name or "").strip()
+    if not STUDENT_ID_RE.match(login_id):
+        raise ValueError("학번은 숫자 6~12자리로 입력하세요.")
+    if not name or len(name) > 30:
+        raise ValueError("이름을 30자 이내로 입력하세요.")
+    if len(password or "") < MIN_PASSWORD:
+        raise ValueError(f"비밀번호는 {MIN_PASSWORD}자 이상이어야 합니다.")
+    return _backend().signup_student({
+        "login_id": login_id, "password": password, "name": name,
+        "department": (department or "").strip()})

@@ -71,13 +71,13 @@ def test_starts_at_login_page(monkeypatch):
     at = _app(monkeypatch)
     assert not at.exception
     assert "user" not in at.session_state
-    assert [t.label for t in at.text_input] == ["학번", "비밀번호"]
+    assert [t.label for t in at.text_input][:2] ==["학번", "비밀번호"]
 
 
 def test_professor_tab_asks_for_employee_id(monkeypatch):
     at = _app(monkeypatch)
     at.radio[0].set_value("교수").run()
-    assert [t.label for t in at.text_input] == ["사번", "비밀번호"]
+    assert [t.label for t in at.text_input][:2] ==["사번", "비밀번호"]
 
 
 def test_wrong_password_is_rejected(monkeypatch):
@@ -105,7 +105,7 @@ def test_logout_returns_to_login(monkeypatch):
     assert at.session_state["user"]["role"] == "student"
     at = _click(at, "로그아웃")
     assert "user" not in at.session_state
-    assert [t.label for t in at.text_input] == ["학번", "비밀번호"]
+    assert [t.label for t in at.text_input][:2] ==["학번", "비밀번호"]
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +286,7 @@ def _fill_new_professor(at: AppTest, login_id: str, name: str, password: str, ad
 def test_admin_tab_asks_for_admin_id(monkeypatch):
     at = _app(monkeypatch)
     at.radio[0].set_value("관리자").run()
-    assert [t.label for t in at.text_input] == ["관리자 ID", "비밀번호"]
+    assert [t.label for t in at.text_input][:2] ==["관리자 ID", "비밀번호"]
 
 
 def test_professor_cannot_login_on_admin_tab(monkeypatch):
@@ -414,3 +414,70 @@ def test_assign_professor_rejects_non_professor_and_unknown_course(mem):
         db.assign_professor(admin, "MAT101", _user("202512345")["id"])
     with pytest.raises(ValueError):
         db.assign_professor(admin, "NOPE999", _user("P2004")["id"])
+
+
+# ---------------------------------------------------------------------------
+# 회원가입 (학생 전용)
+# ---------------------------------------------------------------------------
+def _fill_signup(at: AppTest, login_id: str, name: str, password: str, confirm: str | None = None,
+                 department: str = "컴퓨터공학과") -> AppTest:
+    at.text_input(key="su-id").set_value(login_id)
+    at.text_input(key="su-name").set_value(name)
+    at.text_input(key="su-dept").set_value(department)
+    at.text_input(key="su-pw").set_value(password)
+    at.text_input(key="su-pw2").set_value(password if confirm is None else confirm)
+    return _click(at, "회원가입")
+
+
+def test_signup_logs_in_new_student_with_empty_screens(monkeypatch):
+    at = _fill_signup(_app(monkeypatch), "202699001", "신입생", "newstudent1")
+    assert not at.exception and not at.error
+    user = at.session_state["user"]
+    assert (user["role"], user["name"], user["login_id"]) == ("student", "신입생", "202699001")
+    assert at.session_state["courses"] == []
+    # 수강 강의가 없어도 학생 화면 10개가 모두 깨지지 않는다.
+    for page in STUDENT_PAGES:
+        at = _goto(at, page)
+        assert not at.exception, f"신규 학생 {page} 페이지 예외"
+
+
+def test_signed_up_student_can_login_again(monkeypatch):
+    at = _fill_signup(_app(monkeypatch), "202699002", "신입생", "newstudent1")
+    at = _click(at, "로그아웃")
+    at = _form_login(at, "학생", "202699002", "newstudent1")
+    assert at.session_state["user"]["login_id"] == "202699002"
+
+
+def test_signup_rejects_password_mismatch(monkeypatch):
+    at = _fill_signup(_app(monkeypatch), "202699003", "신입생", "newstudent1", confirm="different1")
+    assert "user" not in at.session_state
+    assert any("서로 다릅니다" in e.value for e in at.error)
+
+
+def test_signup_rejects_duplicate_student_id(monkeypatch):
+    at = _fill_signup(_app(monkeypatch), "202512345", "다른사람", "newstudent1")
+    assert "user" not in at.session_state
+    assert any("이미 가입된 학번" in e.value for e in at.error)
+
+
+def test_signup_rejects_bad_student_id_and_short_password(monkeypatch):
+    at = _fill_signup(_app(monkeypatch), "abc123", "신입생", "newstudent1")
+    assert "user" not in at.session_state and at.error
+    at = _fill_signup(_app(monkeypatch), "202699004", "신입생", "short")
+    assert "user" not in at.session_state and at.error
+
+
+def test_signup_creates_only_student_accounts(mem):
+    db.signup_student("202699005", "newstudent1", "신입생", "수학과")
+    user = db.login("202699005", "newstudent1")
+    assert user["role"] == "student" and user["department"] == "수학과"
+    assert db.load_student(user)["courses"] == []
+
+
+def test_signup_validates_input(mem):
+    for args in [("12345", "newstudent1", "x", ""),        # 학번 5자리
+                 ("2026990066", "short", "x", ""),          # 짧은 비밀번호 (학번은 유효)
+                 ("202699007", "newstudent1", "  ", ""),     # 이름 없음
+                 ("202512345", "newstudent1", "중복", "")]:  # 학번 중복
+        with pytest.raises(ValueError):
+            db.signup_student(*args)
